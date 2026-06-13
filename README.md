@@ -18,6 +18,10 @@
 ```bash
 pip install openpyxl
 ```
+pip 找不到时，确认已经安装了python3，然后执行：
+```bash
+python3 -m pip install openpyxl
+```
 
 Python 3.10+
 

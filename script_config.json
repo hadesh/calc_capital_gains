@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "富途证券年度账单 → 资本利得报告生成器 配置文件",
+    "",
+    "target_accounts: 你的富途账户号码列表 (可选,留空会自动从 xlsx 扫描)",
+    "其余字段可省略,使用内置默认值",
+    "",
+    "overrides 用于补充 DTC IN / Gift 等转入事件的成本基础:",
+    "  当富途账单中转入户(DTC IN)或赠予(Gift)没有真实买入价时,",
+    "  在此手工填入转入时的市价。程序会自动:",
+    "    1. 用 dtc_in 列表(按时间序)做 MWA 重算种子持仓的 avg_cost",
+    "    2. 把 >= 首个持仓年份 的转入注入为 '买入开仓' trade",
+    "",
+    "  每条 override 形如:",
+    "    { 'code': '股票代码', 'currency': 'USD或HKD',",
+    "      'dtc_in': [",
+    "        { 'date': 'YYYY-MM-DD', 'qty': '数量', 'price': '转入市价', 'note': '备注' }",
+    "      ]",
+    "    }"
+  ],
+  "default_option_multiplier": {
+    "USD": "100",
+    "HKD": "500"
+  },
+  "underlying_to_stock": {
+    "CMB": "3968",
+    "MET": "3690",
+    "TCH": "700"
+  },
+  "tax_rate": "0.20",
+  "fx_rates": {
+    "2023": "7.0827",
+    "2024": "7.1884",
+    "2025": "7.0288"
+  },
+  "hkd_peg_divisor": "7.8",
+  "overrides": [
+  ],
+  "skip_categories": [],
+  "skip_directions": [],
+  "output_html": "capital_gains_report_v2.html",
+  "output_json": "capital_gains_report_v2.json",
+  "target_accounts": [
+    "",
+    "",
+    ""
+  ]
+}

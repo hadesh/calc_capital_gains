@@ -1303,9 +1303,34 @@ def load_all_years(target_dir: Path) -> dict:
             all_snapshots.append((year, snap))
     replay_year = next((y for y, _, d in per_year if d["seed_lots"]), None)
     if replay_year is None:
-        raise RuntimeError("no year file contains '期初' snapshot; cannot establish seed")
-    seed_lots = next(d["seed_lots"] for y, _, d in per_year if y == replay_year)
-    skipped_pre_years = [y for y, _, _ in per_year if y < replay_year]
+        # 无期初快照：用最早年份的期末快照作为种子，并跳过该年交易（避免重复计算）
+        earliest_year, _, earliest_data = per_year[0]
+        fallback_seeds: list[tuple[date, PositionLot, str]] = []
+        for snap in earliest_data.get("position_snapshots", []):
+            if snap["qty"] == 0:
+                continue
+            mult = multipliers.get((snap["code"], snap["currency"]), Decimal("1"))
+            lot = PositionLot(
+                code=snap["code"], currency=snap["currency"],
+                open_date=snap["date"], open_price=snap["price"],
+                multiplier=mult,
+                quantity=snap["qty"], fee_per_unit=Decimal("0"),
+                note=f"种子({snap['date'].year}期末-无期初快照)",
+            )
+            fallback_seeds.append((snap["date"], lot, snap["side"]))
+        if len(per_year) == 1:
+            # 只有一年账单：种子就是期末持仓，无交易回放
+            replay_year = earliest_year
+            seed_lots = fallback_seeds
+            skipped_pre_years: list[int] = []
+        else:
+            # 多年账单：用最早年份期末作种子，从下一年开始回放
+            replay_year = earliest_year + 1
+            seed_lots = fallback_seeds
+            skipped_pre_years = [earliest_year]
+    else:
+        seed_lots = next(d["seed_lots"] for y, _, d in per_year if y == replay_year)
+        skipped_pre_years = [y for y, _, _ in per_year if y < replay_year]
     all_trades: list[Trade] = []
     all_movements: list[AssetMovement] = []
     for year, _, data in per_year:

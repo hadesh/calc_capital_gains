@@ -37,6 +37,7 @@ OPTION_UNDERLYING_TO_STOCK: dict[str, str] = {}
 TAX_RATE: Decimal = Decimal("0.20")
 TAX_FX_USD_TO_CNY: dict[int, Decimal] = {}
 TAX_HKD_PEG_DIVISOR: Decimal = Decimal("7.8")
+US_WITHHOLDING_RATE: Decimal = Decimal("0.10")  # China-US tax treaty: 10% withholding on dividends
 SKIP_DIRECTIONS: set[str] = set()
 SKIP_CATEGORIES: set[str] = set()
 OUTPUT_HTML: str = "capital_gains_report_v2.html"
@@ -99,8 +100,11 @@ def load_config(target_dir: Path) -> dict:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
 
     # target_accounts 未填时自动从 xlsx 扫描
+    # (filter out empty strings — ["", ""] is treated as unfilled)
     accounts = raw.get("target_accounts")
-    if not accounts or not isinstance(accounts, list) or len(accounts) == 0:
+    if isinstance(accounts, list):
+        accounts = [a.strip() for a in accounts if a and a.strip()]
+    if not accounts:
         detected = _auto_detect_accounts(target_dir)
         if not detected:
             raise SystemExit(
@@ -108,8 +112,9 @@ def load_config(target_dir: Path) -> dict:
                 f"请确保目录中存在 年度账单 xlsx 文件, 或在 {_CONFIG_FILE} 中手动添加:\n"
                 f'  "target_accounts": ["1001209838769859"]'
             )
-        raw["target_accounts"] = detected
+        accounts = detected
         print(f"[自动检测] 从 xlsx 中发现 {len(detected)} 个账户: {', '.join(detected)}")
+    raw["target_accounts"] = accounts
 
     return raw
 
@@ -238,6 +243,18 @@ class OptionEvent:
     cost_paid: Optional[Decimal]      # 买方支付成本(多头)
     transferred_to_stock: bool
     note: str = ""
+
+
+@dataclass
+class DividendEntry:
+    """股息红利记录 (从 证券-资金进出 提取)."""
+    ts: date                   # 到账日期
+    year: int                  # 所属年度
+    currency: str              # HKD / USD
+    amount: Decimal            # 到账金额(正数)
+    source: str                # 'fund' / 'stock'
+    description: str           # 备注原文
+    account: str = ""          # 账户号码
 
 # --------------------------------------------------------------------------- #
 # Section markers (to be filled by later tasks)
@@ -1062,10 +1079,57 @@ def load_year(xlsx_path: Path) -> dict:
             note=note, event=event,
         ))
 
+    # --- 股息红利: 从 证券-资金进出 提取 ---
+    dividends: list[DividendEntry] = []
+    # 实际已扣缴预提税: [(date, currency, amount_positive, description)]
+    withholding_entries: list[tuple[date, str, Decimal, str]] = []
+    if "证券-资金进出" in wb.sheetnames:
+        ws_div = wb["证券-资金进出"]
+        div_header = None
+        for i, row in enumerate(ws_div.iter_rows(values_only=True)):
+            if i == 0:
+                div_header = list(row)
+                continue
+            rec = dict(zip(div_header, row))
+            acct = str(rec.get("账户号码") or "").strip()
+            if acct and acct not in TARGET_ACCOUNTS:
+                continue
+            note = str(rec.get("备注") or "")
+            direction = str(rec.get("方向") or "")
+            entry_type = str(rec.get("类型") or "")
+            d = _to_datetime(rec.get("日期")).date()
+            currency = str(rec.get("币种") or "")
+            raw_amt = _to_decimal(rec.get("变动金额"))
+
+            # --- 股息 In ---
+            if direction != "Out":
+                source = None
+                if "Fund Cash Dividend" in note:
+                    source = "fund"
+                elif "DIVIDEND" in note.upper() or "dividend" in note:
+                    source = "stock"
+                if source is not None:
+                    amount = abs(raw_amt)
+                    if amount > 0:
+                        dividends.append(DividendEntry(
+                            ts=d, year=d.year, currency=currency,
+                            amount=amount, source=source,
+                            description=note, account=acct,
+                        ))
+                continue
+
+            # --- 预提税 Out (公司行动, 备注含 WITHHOLDING TAX 或 TAX) ---
+            if entry_type == "公司行动" and direction == "Out":
+                note_upper = note.upper()
+                if "WITHHOLDING TAX" in note_upper or "TAX" in note_upper:
+                    withholding_entries.append((d, currency, abs(raw_amt), note))
+
     return {"trades": trades, "movements": movements,
             "multipliers": multipliers, "seed_lots": seed_lots,
             "adjustments": adjustments, "other_unhandled": other_unhandled,
-            "position_snapshots": position_snapshots}
+            "position_snapshots": position_snapshots,
+            "dividends": dividends,
+            "withholding_entries": withholding_entries}
 
 
 def _build_alias_map(adjustments: list[tuple[date, str, Decimal, str]]
@@ -1293,12 +1357,16 @@ def load_all_years(target_dir: Path) -> dict:
     all_adjustments: list[tuple[date, str, Decimal, str]] = []
     all_other_unhandled: list = []
     all_snapshots: list[dict] = []
+    all_dividends: list[DividendEntry] = []
+    all_withholding: list[tuple[date, str, Decimal, str]] = []
     for year, path in files:
         data = load_year(path)
         per_year.append((year, path, data))
         multipliers.update(data["multipliers"])
         all_adjustments.extend(data.get("adjustments", []))
         all_other_unhandled.extend(data.get("other_unhandled", []))
+        all_dividends.extend(data.get("dividends", []))
+        all_withholding.extend(data.get("withholding_entries", []))
         for snap in data.get("position_snapshots", []):
             all_snapshots.append((year, snap))
     replay_year = next((y for y, _, d in per_year if d["seed_lots"]), None)
@@ -1384,6 +1452,8 @@ def load_all_years(target_dir: Path) -> dict:
         "cost_basis_overrides": override_info,
         "position_snapshots": all_snapshots,
         "tax_config": tax_config,
+        "dividends": all_dividends,
+        "withholding_entries": all_withholding,
     }
 
 
@@ -1595,8 +1665,8 @@ def compute_annual_summary(
             "end_positions": end_positions,
         })
 
-    # 添加每年的港币合计行（USD × 7.8 换算）
-    HKD_PEG = Decimal("7.8")
+    # 添加每年的港币合计行（USD × hkd_peg_divisor 换算）
+    HKD_PEG = TAX_HKD_PEG_DIVISOR
     all_years = sorted({r["year"] for r in summary_rows})
     for yr in all_years:
         rows_this_year = [r for r in summary_rows if r["year"] == yr]
@@ -1663,7 +1733,9 @@ def render_html(realized: list[RealizedPnL], opt_events: list[OptionEvent],
                 leftover_lots: list, warnings: list[str],
                 alias_map: dict, alias_unresolved: list[str],
                 other_unhandled: list, skipped_pre_years: list[int],
-                annual_summary: list[dict] | None = None) -> str:
+                annual_summary: list[dict] | None = None,
+                dividends: list[DividendEntry] | None = None,
+                withholding_entries: list[tuple[date, str, Decimal, str]] | None = None) -> str:
     total_by_ccy: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     yearly_by_ccy: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal("0"))
     monthly_by_ccy: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
@@ -1845,13 +1917,15 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
     # ----- 年度缴税估算 -----
     parts.append("<h2>年度缴税估算 (按 20% 资本利得税)</h2>")
     parts.append("<p style='color:#666;font-size:0.9em'>"
-                 "口径: 按 (年份, 币种) 聚合, 当年某币种合计 PnL&gt;0 才计税(亏损不抵扣); "
+                 "口径: 先将各币种 PnL 按年末汇率折算为 CNY, 再按年度汇总; "
+                 "当年 CNY 合计 PnL&gt;0 才计税, 亏损年度不计税; "
                  f"USD/CNY 用年末中间价, HKD/CNY = USD/CNY ÷ {TAX_HKD_PEG_DIVISOR} (固定挂钩). "
                  "仅供参考, 实际申报口径以税务机关为准.</p>")
-    parts.append("<table><tr><th>年份</th><th>币种</th><th>年度 PnL</th>"
-                 "<th>应税额(20%)</th><th>年末汇率</th><th>折合 CNY 税额</th></tr>")
-    tax_rows: list[tuple[int, str, Decimal, Decimal, Decimal, Decimal]] = []
-    tax_total_cny = Decimal("0")
+    parts.append("<table><tr><th>年份</th><th>币种</th><th>年度 PnL (原币)</th>"
+                 "<th>年末汇率</th><th>折合 CNY PnL</th></tr>")
+    # Step 1: per (year, currency) CNY PnL
+    detail_rows: list[tuple[int, str, Decimal, Decimal, Decimal]] = []  # yr, ccy, pnl, fx, pnl_cny
+    pnl_cny_by_year: dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
     for yr in sorted(years_seen):
         for ccy in currencies:
             pnl = sum((v for (y, c, a), v in by_year_asset.items() if y == yr and c == ccy),
@@ -1865,27 +1939,142 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
                 fx = usd_fx / TAX_HKD_PEG_DIVISOR
             else:
                 fx = None
-            taxable = pnl if pnl > 0 else Decimal("0")
-            tax_native = (taxable * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            tax_cny = (tax_native * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
-                if fx is not None else None
-            tax_rows.append((yr, ccy, pnl, tax_native, fx, tax_cny))
-            if tax_cny is not None:
-                tax_total_cny += tax_cny
-    for yr, ccy, pnl, tax_native, fx, tax_cny in tax_rows:
-        cls = "pos" if pnl >= 0 else "neg"
+            pnl_cny = (pnl * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+                if fx is not None else Decimal("0")
+            detail_rows.append((yr, ccy, pnl, fx, pnl_cny))
+            pnl_cny_by_year[yr] += pnl_cny
+    # Step 2: per-year CNY total tax
+    tax_by_year: dict[int, Decimal] = {}
+    for yr in sorted(years_seen):
+        total_cny_pnl = pnl_cny_by_year[yr]
+        taxable_cny = total_cny_pnl if total_cny_pnl > 0 else Decimal("0")
+        tax_cny = (taxable_cny * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        tax_by_year[yr] = tax_cny
+    # Render detail rows + per-year subtotal rows
+    tax_total_cny = Decimal("0")
+    for yr in sorted(years_seen):
+        yr_details = [(ccy, pnl, fx, pnl_cny) for (y, ccy, pnl, fx, pnl_cny) in detail_rows if y == yr]
+        total_cny_pnl = pnl_cny_by_year[yr]
+        tax_cny = tax_by_year[yr]
+        tax_total_cny += tax_cny
+        for i, (ccy, pnl, fx, pnl_cny) in enumerate(yr_details):
+            cls = "pos" if pnl >= 0 else "neg"
+            parts.append(
+                f"<tr><td class='date'>{yr if i == 0 else ''}</td><td>{_esc(ccy)}</td>"
+                f"<td class='pnl {cls}'>{_fmt_dec(pnl)}</td>"
+                f"<td>{_fmt_dec(fx, 4) if fx is not None else '—'}</td>"
+                f"<td class='pnl'>{_fmt_dec(pnl_cny)}</td></tr>"
+            )
+        # Year subtotal row
+        yr_cls = "pos" if total_cny_pnl >= 0 else "neg"
         parts.append(
-            f"<tr><td class='date'>{yr}</td><td>{_esc(ccy)}</td>"
-            f"<td class='pnl {cls}'>{_fmt_dec(pnl)}</td>"
-            f"<td class='pnl'>{_fmt_dec(tax_native) if tax_native > 0 else '—'}</td>"
-            f"<td>{_fmt_dec(fx, 4) if fx is not None else '—'}</td>"
-            f"<td class='pnl'>{_fmt_dec(tax_cny) if tax_cny is not None and tax_cny > 0 else '—'}</td></tr>"
+            f"<tr style='background:#f0f4f8'><td class='date'><b>{yr} 合计</b></td><td>CNY</td>"
+            f"<td></td><td></td>"
+            f"<td class='pnl {yr_cls}'><b>{_fmt_dec(total_cny_pnl)}</b></td></tr>"
+        )
+        parts.append(
+            f"<tr style='background:#f0f4f8'><td colspan='4' class='date'>"
+            f"<b>{yr} 应税额 (CNY {TAX_RATE*100}%, "
+            f"{'盈利' if total_cny_pnl > 0 else '亏损不计税'})</b></td>"
+            f"<td class='pnl'><b>{_fmt_dec(tax_cny)}</b></td></tr>"
         )
     parts.append(
-        f"<tr><td colspan='5' class='date'><b>合计 CNY 税额</b></td>"
+        f"<tr><td colspan='4' class='date'><b>合计 CNY 税额</b></td>"
         f"<td class='pnl pos'><b>{_fmt_dec(tax_total_cny)}</b></td></tr>"
     )
     parts.append("</table>")
+
+    # ----- 股息红利所得 (利息股息红利所得, 与财产转让所得分开申报) -----
+    if dividends:
+        parts.append("<h2>股息红利所得 (利息、股息、红利所得)</h2>")
+        parts.append("<p style='color:#666;font-size:0.9em'>"
+                     "口径: 属于“利息、股息、红利所得”, 与资本利得(财产转让所得)分开申报; "
+                     "税率 20%%; 美股股息已按中美协定扣缴 10%% 预提税(可申请境外税收抵免); "
+                     f"USD/CNY 用年末中间价, HKD/CNY = USD/CNY ÷ {TAX_HKD_PEG_DIVISOR}. "
+                     "仅供参考, 实际申报口径以税务机关为准.</p>")
+        # Summary by (year, currency, source)
+        div_by_key: dict[tuple[int, str, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        div_cnt: dict[tuple[int, str, str], int] = defaultdict(int)
+        for d in dividends:
+            key = (d.year, d.currency, d.source)
+            div_by_key[key] += d.amount
+            div_cnt[key] += 1
+        # Table
+        parts.append("<table><tr><th>年份</th><th>币种</th><th>来源</th><th>笔数</th>"
+                     "<th>金额(原币)</th><th>年末汇率</th><th>折合 CNY</th>"
+                     "<th>预提税(境外)</th><th>应补 CNY 税</th></tr>")
+        div_total_cny = Decimal("0")
+        div_total_withheld_cny = Decimal("0")
+        div_total_due_cny = Decimal("0")
+        # Build actual withholding per (year, currency) from statement
+        actual_wh: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        if withholding_entries:
+            for (wh_date, wh_ccy, wh_amt, _note) in withholding_entries:
+                actual_wh[(wh_date.year, wh_ccy)] += wh_amt
+        for (yr, ccy, src), amt in sorted(div_by_key.items()):
+            usd_fx = TAX_FX_USD_TO_CNY.get(yr)
+            if usd_fx is None:
+                fx = None
+            elif ccy == "USD":
+                fx = usd_fx
+            elif ccy == "HKD":
+                fx = usd_fx / TAX_HKD_PEG_DIVISOR
+            else:
+                fx = None
+            amt_cny = (amt * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+                if fx is not None else Decimal("0")
+            # Use actual withholding from statement if available; fallback to 10% estimate
+            wh_actual = actual_wh.get((yr, ccy), Decimal("0"))
+            if wh_actual > 0:
+                withheld_native = wh_actual
+                wh_note = "实际扣缴"
+            elif ccy == "USD":
+                withheld_native = (amt * US_WITHHOLDING_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                wh_note = "估算10%"
+            else:
+                withheld_native = Decimal("0")
+                wh_note = ""
+            withheld_cny = (withheld_native * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+                if fx is not None and withheld_native > 0 else Decimal("0")
+            # China tax due = 20% of CNY amount - foreign tax credit
+            china_tax_full = (amt_cny * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            china_tax_due = max(china_tax_full - withheld_cny, Decimal("0"))
+            div_total_cny += amt_cny
+            div_total_withheld_cny += withheld_cny
+            div_total_due_cny += china_tax_due
+            src_label = "基金分红" if src == "fund" else "股票分红"
+            wh_label = f" ({wh_note})" if wh_note else ""
+            parts.append(
+                f"<tr><td class='date'>{yr}</td><td>{_esc(ccy)}</td>"
+                f"<td>{src_label}</td><td>{div_cnt[(yr, ccy, src)]}</td>"
+                f"<td class='pnl pos'>{_fmt_dec(amt)}</td>"
+                f"<td>{_fmt_dec(fx, 4) if fx is not None else '—'}</td>"
+                f"<td class='pnl pos'>{_fmt_dec(amt_cny)}</td>"
+                f"<td class='pnl' title='{_esc(wh_label)}'>{_fmt_dec(withheld_cny) if withheld_cny > 0 else '—'}"
+                f"{'<br/><small style=\"color:#888\">' + _esc(wh_label) + '</small>' if wh_label else ''}</td>"
+                f"<td class='pnl'>{_fmt_dec(china_tax_due)}</td></tr>"
+            )
+        parts.append(
+            f"<tr style='background:#f0f4f8'><td colspan='6' class='date'><b>合计</b></td>"
+            f"<td class='pnl pos'><b>{_fmt_dec(div_total_cny)}</b></td>"
+            f"<td class='pnl'><b>{_fmt_dec(div_total_withheld_cny) if div_total_withheld_cny > 0 else '—'}</b></td>"
+            f"<td class='pnl'><b>{_fmt_dec(div_total_due_cny)}</b></td></tr>"
+        )
+        parts.append("</table>")
+        # Detail list
+        parts.append("<details><summary>股息明细 (共 "
+                     f"{len(dividends)} 笔)</summary>")
+        parts.append("<table><tr><th>日期</th><th>币种</th><th>金额</th>"
+                     "<th>来源</th><th>备注</th></tr>")
+        for d in sorted(dividends, key=lambda x: x.ts, reverse=True):
+            src_label = "基金分红" if d.source == "fund" else "股票分红"
+            parts.append(
+                f"<tr><td class='date'>{d.ts}</td><td>{_esc(d.currency)}</td>"
+                f"<td class='pnl pos'>{_fmt_dec(d.amount, 4)}</td>"
+                f"<td>{src_label}</td>"
+                f"<td class='note'>{_esc(d.description)}</td></tr>"
+            )
+        parts.append("</table></details>")
 
     parts.append("<h2>盈亏细分类别</h2>")
     sub_ccys = sorted({k[1] for k in by_subcat})
@@ -2137,12 +2326,15 @@ def _to_jsonable(obj):
 
 
 def _build_tax_estimate(by_year_asset: dict) -> dict:
-    """根据 by_year_asset 复算各 (year, ccy) 的税额, 返回结构化 dict 供 JSON 输出。"""
+    """根据 by_year_asset 计算税额: 先将各币种 PnL 折算 CNY, 再按年度汇总后计税。
+    亏损年度不计税, 跨币种盈亏可互抵。
+    """
+    # Step 1: per (year, ccy) PnL and CNY conversion
     agg: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal("0"))
     for (y, c, _a), v in by_year_asset.items():
         agg[(y, c)] += v
+    pnl_cny_by_year: dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
     rows = []
-    total_cny = Decimal("0")
     for (yr, ccy), pnl in sorted(agg.items()):
         usd_fx = TAX_FX_USD_TO_CNY.get(yr)
         if usd_fx is None:
@@ -2153,25 +2345,41 @@ def _build_tax_estimate(by_year_asset: dict) -> dict:
             fx = usd_fx / TAX_HKD_PEG_DIVISOR
         else:
             fx = None
-        taxable = pnl if pnl > 0 else Decimal("0")
-        tax_native = (taxable * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        tax_cny = (tax_native * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
-            if fx is not None else None
-        if tax_cny is not None:
-            total_cny += tax_cny
+        pnl_cny = (pnl * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+            if fx is not None else Decimal("0")
+        pnl_cny_by_year[yr] += pnl_cny
         rows.append({
             "year": yr, "currency": ccy,
-            "pnl": str(pnl), "tax_native": str(tax_native),
+            "pnl": str(pnl),
             "fx_to_cny": str(fx) if fx is not None else None,
-            "tax_cny": str(tax_cny) if tax_cny is not None else None,
+            "pnl_cny": str(pnl_cny),
         })
-    return {"tax_rate": str(TAX_RATE), "rows": rows, "total_cny": str(total_cny)}
+    # Step 2: per-year CNY total and tax
+    year_totals = []
+    total_cny = Decimal("0")
+    for yr in sorted(pnl_cny_by_year):
+        total_cny_pnl = pnl_cny_by_year[yr]
+        taxable_cny = total_cny_pnl if total_cny_pnl > 0 else Decimal("0")
+        tax_cny = (taxable_cny * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_cny += tax_cny
+        year_totals.append({
+            "year": yr,
+            "total_pnl_cny": str(total_cny_pnl),
+            "taxable_cny": str(taxable_cny),
+            "tax_cny": str(tax_cny),
+        })
+    return {
+        "tax_rate": str(TAX_RATE),
+        "rows": rows,
+        "year_totals": year_totals,
+        "total_cny": str(total_cny),
+    }
 
 
 def render_json(realized, opt_events, seed_lots, leftover_lots,
                 year_range, file_list, warnings, alias_map,
                 alias_unresolved, other_unhandled,
-                annual_summary=None) -> str:
+                annual_summary=None, dividends=None, withholding_entries=None) -> str:
     # 统计分类汇总,放进 summary 方便外部消费
     by_year_asset: dict[tuple, Decimal] = defaultdict(lambda: Decimal("0"))
     by_subcat: dict[tuple, Decimal] = defaultdict(lambda: Decimal("0"))
@@ -2218,6 +2426,11 @@ def render_json(realized, opt_events, seed_lots, leftover_lots,
             {"side": side, **asdict(lot)} for side, lot in leftover_lots
         ],
         "annual_summary": annual_summary or [],
+        "dividends": [asdict(d) for d in (dividends or [])],
+        "withholding_entries": [
+            {"date": d.isoformat(), "currency": ccy, "amount": str(amt), "description": note}
+            for (d, ccy, amt, note) in (withholding_entries or [])
+        ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, default=_to_jsonable)
 
@@ -2249,6 +2462,8 @@ def main() -> None:
     # 把 cost_basis_overrides 的处理信息前置到 warnings 区,方便用户核对
     warnings = list(data.get("cost_basis_overrides", [])) + warnings
     leftover = list(book.iter_open())
+    dividends = data.get("dividends", [])
+    withholding_entries = data.get("withholding_entries", [])
 
     # 计算年度交易概况
     annual_summary = compute_annual_summary(
@@ -2263,6 +2478,8 @@ def main() -> None:
         data.get("alias_map", {}), data.get("alias_unresolved", []),
         data.get("other_unhandled", []), data.get("skipped_pre_years", []),
         annual_summary,
+        dividends=dividends,
+        withholding_entries=withholding_entries,
     )
     json_str = render_json(
         realized, opt_events, data["seed_lots"], leftover,
@@ -2270,6 +2487,8 @@ def main() -> None:
         data.get("alias_map", {}), data.get("alias_unresolved", []),
         data.get("other_unhandled", []),
         annual_summary,
+        dividends=dividends,
+        withholding_entries=withholding_entries,
     )
     html_path = target / OUTPUT_HTML
     json_path = target / OUTPUT_JSON
@@ -2280,6 +2499,7 @@ def main() -> None:
     print(f"已生成: {json_path}")
     print(f"涉及年份: {data['year_range']}, 已实现 {len(realized)} 笔, "
           f"期权特殊事件 {len(opt_events)} 笔, 剩余未平仓 {len(leftover)} 笔, "
+          f"股息 {len(dividends)} 笔, 预提税 {len(withholding_entries)} 笔, "
           f"warnings {len(warnings)} 条")
     if data.get("alias_map"):
         print(f"代码别名归一化: {len(data['alias_map'])} 项")
@@ -2331,6 +2551,30 @@ def main() -> None:
                 f"年末{row['end_count']}只/{_f(row['end_market_value'])}, "
                 f"浮动{_f(row['unrealized_pnl'])}"
             )
+
+    # 股息红利汇总
+    if dividends:
+        div_by_yr_ccy: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        div_cnt_by_yr_ccy: dict[tuple[int, str], int] = defaultdict(int)
+        for d in dividends:
+            div_by_yr_ccy[(d.year, d.currency)] += d.amount
+            div_cnt_by_yr_ccy[(d.year, d.currency)] += 1
+        print()
+        print("=== 股息红利所得 (利息、股息、红利所得) ===")
+        for (yr, ccy), amt in sorted(div_by_yr_ccy.items()):
+            cnt = div_cnt_by_yr_ccy[(yr, ccy)]
+            print(f"  {yr} {ccy}: {amt:>14,.4f}  ({cnt} 笔)")
+    if withholding_entries:
+        wh_by_yr_ccy: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal("0"))
+        wh_cnt_by_yr_ccy: dict[tuple[int, str], int] = defaultdict(int)
+        for (wh_d, wh_ccy, wh_amt, _note) in withholding_entries:
+            wh_by_yr_ccy[(wh_d.year, wh_ccy)] += wh_amt
+            wh_cnt_by_yr_ccy[(wh_d.year, wh_ccy)] += 1
+        print()
+        print("=== 境外预提税 (WITHHOLDING TAX, 可用于境外税收抵免) ===")
+        for (yr, ccy), amt in sorted(wh_by_yr_ccy.items()):
+            cnt = wh_cnt_by_yr_ccy[(yr, ccy)]
+            print(f"  {yr} {ccy}: {amt:>14,.4f}  ({cnt} 笔)")
 
 
 if __name__ == "__main__":

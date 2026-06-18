@@ -256,6 +256,15 @@ class DividendEntry:
     description: str           # 备注原文
     account: str = ""          # 账户号码
 
+@dataclass
+class StockSplit:
+    """股票拆股/合股事件 (从 证券-资产进出 的 'X For Y SPLIT' 备注提取)。"""
+    ts: datetime               # 生效日期
+    code: str                  # 股票代码
+    currency: str
+    factor: Decimal            # new/old 比例: new_qty = old_qty * factor (合股 < 1, 拆股 > 1)
+    note: str = ""             # 原备注
+
 # --------------------------------------------------------------------------- #
 # Section markers (to be filled by later tasks)
 # --------------------------------------------------------------------------- #
@@ -436,6 +445,26 @@ class PositionBook:
             yield "long", pos
         for pos in self._short.values():
             yield "short", pos
+
+    def apply_split(self, code: str, currency: str, factor: Decimal) -> bool:
+        """对 (code, currency) 的多/空持仓应用拆股/合股。
+
+        factor = new/old: 拆股 factor>1(如 4-for-1 -> 4), 合股 factor<1(如 1-for-5 -> 0.2)。
+        qty *= factor, avg_cost /= factor, avg_fee_per_unit /= factor, 保持总成本不变。
+        返回是否命中任何持仓。
+        """
+        if factor <= 0:
+            raise ValueError(f"split factor must be positive: {factor}")
+        hit = False
+        for tab in (self._long, self._short):
+            pos = tab.get((code, currency))
+            if pos is None or pos.qty == 0:
+                continue
+            pos.qty = pos.qty * factor
+            pos.avg_cost = pos.avg_cost / factor
+            pos.avg_fee_per_unit = pos.avg_fee_per_unit / factor
+            hit = True
+        return hit
 
     # --- v1 接口兼容 (供既有 _handle_*_fallback 走 PositionLot 调用路径用) ---
     def open_lot(self, lot: PositionLot, side: str) -> None:
@@ -623,6 +652,29 @@ def parse_asset_movement_event(note: str) -> str:
     if s == "Option Assignment":
         return "ASS-P"
     raise ValueError(f"unrecognized asset-movement note: {note!r}")
+
+
+_SPLIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s+For\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _parse_split_factor(note: str) -> Optional[Decimal]:
+    """解析股票拆股/合股备注, 返回 new/old 比例因子(new_qty = old_qty * factor)。
+
+    富途备注格式为 "<A> For <B>": A=新股数, B=旧股数, factor = A / B。
+      - "REVERSE SPLIT 1 For 5"  -> 合股, factor = 1/5 = 0.2
+      - "FORWARD SPLIT 4 For 1" / "SPLIT 4 For 1" -> 拆股, factor = 4
+    备注不含 SPLIT 或无法解析时返回 None。
+    """
+    if "SPLIT" not in note.upper():
+        return None
+    m = _SPLIT_RE.search(note)
+    if not m:
+        return None
+    new_n = Decimal(m.group(1))
+    old_n = Decimal(m.group(2))
+    if old_n == 0:
+        return None
+    return new_n / old_n
 
 
 def process_option_event(mv: AssetMovement, book: PositionBook,
@@ -1036,6 +1088,8 @@ def load_year(xlsx_path: Path) -> dict:
     movements: list[AssetMovement] = []
     adjustments: list[tuple[date, str, Decimal, str]] = []  # (日期, 代码, 带符号数量, 备注)
     other_unhandled: list[tuple[date, str, str, Decimal, str]] = []  # warning 用
+    stock_splits: list[StockSplit] = []
+    _split_seen: set = set()  # 拆股事件去重(OUT/IN 两行合为一次)
     ws = wb["证券-资产进出"]
     header = None
     for i, row in enumerate(ws.iter_rows(values_only=True)):
@@ -1061,6 +1115,18 @@ def load_year(xlsx_path: Path) -> dict:
         if str(rec.get("类型") or "") == "多空反转平仓":
             continue
         if category != "期权":
+            # 股票拆股/合股: 解析比例后参与回放(按比例调整 qty 与 avg_cost)
+            split_factor = _parse_split_factor(note)
+            if split_factor is not None:
+                split_key = (d, code, currency, split_factor)
+                if split_key not in _split_seen:
+                    _split_seen.add(split_key)
+                    stock_splits.append(StockSplit(
+                        ts=_to_datetime(rec.get("日期")),
+                        code=code, currency=currency,
+                        factor=split_factor, note=note,
+                    ))
+                continue
             # 股票相关的资产进出(DTC IN / Gift / Account Upgrade) 暂不参与回放,仅记 warning
             if note and note != "Account Upgrade":
                 other_unhandled.append((d, code, currency, qty_signed, note))
@@ -1121,13 +1187,14 @@ def load_year(xlsx_path: Path) -> dict:
             # --- 预提税 Out (公司行动, 备注含 WITHHOLDING TAX 或 TAX) ---
             if entry_type == "公司行动" and direction == "Out":
                 note_upper = note.upper()
-                if "WITHHOLDING TAX" in note_upper or "TAX" in note_upper:
+                if "WITHHOLDING TAX" in note_upper:
                     withholding_entries.append((d, currency, abs(raw_amt), note))
 
     return {"trades": trades, "movements": movements,
             "multipliers": multipliers, "seed_lots": seed_lots,
             "adjustments": adjustments, "other_unhandled": other_unhandled,
             "position_snapshots": position_snapshots,
+            "stock_splits": stock_splits,
             "dividends": dividends,
             "withholding_entries": withholding_entries}
 
@@ -1401,11 +1468,13 @@ def load_all_years(target_dir: Path) -> dict:
         skipped_pre_years = [y for y, _, _ in per_year if y < replay_year]
     all_trades: list[Trade] = []
     all_movements: list[AssetMovement] = []
+    all_stock_splits: list[StockSplit] = []
     for year, _, data in per_year:
         if year < replay_year:
             continue
         all_trades.extend(data["trades"])
         all_movements.extend(data["movements"])
+        all_stock_splits.extend(data.get("stock_splits", []))
 
     # 别名归一化
     alias, alias_unresolved = _build_alias_map(all_adjustments)
@@ -1413,6 +1482,8 @@ def load_all_years(target_dir: Path) -> dict:
         t.code = _apply_alias_to_code(t.code, alias)
     for mv in all_movements:
         mv.code = _apply_alias_to_code(mv.code, alias)
+    for sp in all_stock_splits:
+        sp.code = _apply_alias_to_code(sp.code, alias)
     # multipliers / seed_lots 也对齐
     new_multipliers: dict[tuple[str, str], Decimal] = {}
     for (code, ccy), m in multipliers.items():
@@ -1452,6 +1523,7 @@ def load_all_years(target_dir: Path) -> dict:
         "cost_basis_overrides": override_info,
         "position_snapshots": all_snapshots,
         "tax_config": tax_config,
+        "stock_splits": all_stock_splits,
         "dividends": all_dividends,
         "withholding_entries": all_withholding,
     }
@@ -1480,12 +1552,14 @@ def _snapshot_book(book: PositionBook) -> list[tuple[str, dict]]:
 
 def replay(trades: list[Trade], movements: list[AssetMovement],
            seed_lots: list[tuple[date, PositionLot, str]],
+           stock_splits: list[StockSplit] | None = None,
            ) -> tuple[list[RealizedPnL], list[OptionEvent], PositionBook, list[str], dict[int, list]]:
     """Walk events chronologically, returning realized P/L, tracked option events,
     end-state book, a list of warning strings, and year-end book snapshots.
 
     在期权事件触发时,优先调整同期股票流水的价格(注入权利金调整),
     使被动买卖与后续主动买卖在同一 FIFO 队列中对齐成本。
+    股票拆股/合股(StockSplit)在生效日按比例调整 qty 与 avg_cost。
     遇到仓位不足/状态异常时记入 warnings 并跳过该事件,不中断回放。
     """
     book = PositionBook()
@@ -1502,6 +1576,9 @@ def replay(trades: list[Trade], movements: list[AssetMovement],
         events.append((t.ts, 1, t))
     for mv in movements:
         events.append((mv.ts, 0, mv))
+    for sp in (stock_splits or []):
+        # kind=2: 同日先处理 trade/movement, 再应用拆股(避免与当日交易顺序冲突)
+        events.append((sp.ts, 2, sp))
     events.sort(key=lambda e: (e[0], e[1]))
 
     realized: list[RealizedPnL] = []
@@ -1514,6 +1591,13 @@ def replay(trades: list[Trade], movements: list[AssetMovement],
         if current_year is not None and event_year != current_year:
             year_end_books[current_year] = _snapshot_book(book)
         current_year = event_year
+        if isinstance(ev, StockSplit):
+            if not book.apply_split(ev.code, ev.currency, ev.factor):
+                warnings.append(
+                    f"拆股/合股 {ev.ts.date()} {ev.code}/{ev.currency} "
+                    f"(factor={ev.factor}) 未命中持仓, 已忽略"
+                )
+            continue
         try:
             if isinstance(ev, Trade):
                 realized.extend(process_trade(ev, book))
@@ -2457,7 +2541,8 @@ def main() -> None:
         TAX_FX_USD_TO_CNY.update(tax_config["fx_rates"])
 
     realized, opt_events, book, warnings, year_end_books = replay(
-        data["trades"], data["movements"], data["seed_lots"]
+        data["trades"], data["movements"], data["seed_lots"],
+        data.get("stock_splits", []),
     )
     # 把 cost_basis_overrides 的处理信息前置到 warnings 区,方便用户核对
     warnings = list(data.get("cost_basis_overrides", [])) + warnings

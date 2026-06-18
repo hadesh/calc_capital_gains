@@ -37,6 +37,7 @@ OPTION_UNDERLYING_TO_STOCK: dict[str, str] = {}
 TAX_RATE: Decimal = Decimal("0.20")
 TAX_FX_USD_TO_CNY: dict[int, Decimal] = {}
 TAX_HKD_PEG_DIVISOR: Decimal = Decimal("7.8")
+TAX_HKD_TO_CNY: dict[int, Decimal] = {}   # 年末 HKD/CNY 直接中间价(优先于联系汇率折算)
 US_WITHHOLDING_RATE: Decimal = Decimal("0.10")  # China-US tax treaty: 10% withholding on dividends
 SKIP_DIRECTIONS: set[str] = set()
 SKIP_CATEGORIES: set[str] = set()
@@ -48,6 +49,27 @@ _CONFIG_FILE = "script_config.json"
 _CONFIG_LOADED = False
 _CONFIG_OVERRIDES: list[dict] = []
 _CONFIG_TAX: dict = {}
+
+
+def _fx_to_cny(year: int, currency: str) -> Optional[Decimal]:
+    """返回某纳税年度末某币种兑 CNY 的折算汇率(用于将原币所得折人民币)。
+
+    USD: 取 fx_rates[year](央行年末中间价)。
+    HKD: 优先取 hkd_rates[year](央行港币兑人民币直接中间价);
+         缺失时回退 USD/CNY ÷ 联系汇率挂钩值(近似, 有0.3%~0.5%系统偏差)。
+    其他币种(含 CNY): 返回 None, 不纳入境外所得折算。
+    """
+    if currency == "USD":
+        return TAX_FX_USD_TO_CNY.get(year)
+    if currency == "HKD":
+        direct = TAX_HKD_TO_CNY.get(year)
+        if direct is not None:
+            return direct
+        usd_fx = TAX_FX_USD_TO_CNY.get(year)
+        if usd_fx is None:
+            return None
+        return usd_fx / TAX_HKD_PEG_DIVISOR
+    return None
 
 
 def _auto_detect_accounts(target_dir: Path) -> list[str]:
@@ -123,7 +145,7 @@ def apply_config(raw: dict) -> None:
     """将配置 JSON 应用到模块级全局变量。"""
     global TARGET_ACCOUNTS, TARGET_ACCOUNT
     global DEFAULT_OPTION_MULTIPLIER, OPTION_UNDERLYING_TO_STOCK
-    global TAX_RATE, TAX_FX_USD_TO_CNY, TAX_HKD_PEG_DIVISOR
+    global TAX_RATE, TAX_FX_USD_TO_CNY, TAX_HKD_PEG_DIVISOR, TAX_HKD_TO_CNY
     global SKIP_DIRECTIONS, SKIP_CATEGORIES
     global OUTPUT_HTML, OUTPUT_JSON
     global _CONFIG_LOADED, _CONFIG_OVERRIDES, _CONFIG_TAX
@@ -149,6 +171,8 @@ def apply_config(raw: dict) -> None:
         TAX_FX_USD_TO_CNY = {int(k): Decimal(str(v)) for k, v in raw["fx_rates"].items()}
     if "hkd_peg_divisor" in raw:
         TAX_HKD_PEG_DIVISOR = Decimal(str(raw["hkd_peg_divisor"]))
+    if "hkd_rates" in raw:
+        TAX_HKD_TO_CNY = {int(k): Decimal(str(v)) for k, v in raw["hkd_rates"].items()}
 
     # 过滤
     if "skip_categories" in raw:
@@ -2003,7 +2027,7 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
     parts.append("<p style='color:#666;font-size:0.9em'>"
                  "口径: 先将各币种 PnL 按年末汇率折算为 CNY, 再按年度汇总; "
                  "当年 CNY 合计 PnL&gt;0 才计税, 亏损年度不计税; "
-                 f"USD/CNY 用年末中间价, HKD/CNY = USD/CNY ÷ {TAX_HKD_PEG_DIVISOR} (固定挂钩). "
+                 "USD/CNY 用年末中间价, HKD/CNY 优先用年末直接中间价(缺失时用联系汇率折算). "
                  "仅供参考, 实际申报口径以税务机关为准.</p>")
     parts.append("<table><tr><th>年份</th><th>币种</th><th>年度 PnL (原币)</th>"
                  "<th>年末汇率</th><th>折合 CNY PnL</th></tr>")
@@ -2014,15 +2038,7 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
         for ccy in currencies:
             pnl = sum((v for (y, c, a), v in by_year_asset.items() if y == yr and c == ccy),
                       Decimal("0"))
-            usd_fx = TAX_FX_USD_TO_CNY.get(yr)
-            if usd_fx is None:
-                fx = None
-            elif ccy == "USD":
-                fx = usd_fx
-            elif ccy == "HKD":
-                fx = usd_fx / TAX_HKD_PEG_DIVISOR
-            else:
-                fx = None
+            fx = _fx_to_cny(yr, ccy)
             pnl_cny = (pnl * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
                 if fx is not None else Decimal("0")
             detail_rows.append((yr, ccy, pnl, fx, pnl_cny))
@@ -2074,7 +2090,7 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
         parts.append("<p style='color:#666;font-size:0.9em'>"
                      "口径: 属于“利息、股息、红利所得”, 与资本利得(财产转让所得)分开申报; "
                      "税率 20%%; 美股股息已按中美协定扣缴 10%% 预提税(可申请境外税收抵免); "
-                     f"USD/CNY 用年末中间价, HKD/CNY = USD/CNY ÷ {TAX_HKD_PEG_DIVISOR}. "
+                     "USD/CNY 用年末中间价, HKD/CNY 优先用年末直接中间价(缺失时用联系汇率折算). "
                      "仅供参考, 实际申报口径以税务机关为准.</p>")
         # Summary by (year, currency, source)
         div_by_key: dict[tuple[int, str, str], Decimal] = defaultdict(lambda: Decimal("0"))
@@ -2095,31 +2111,46 @@ summary{cursor:pointer;font-weight:600;font-size:16px;padding:6px 0;}
         if withholding_entries:
             for (wh_date, wh_ccy, wh_amt, _note) in withholding_entries:
                 actual_wh[(wh_date.year, wh_ccy)] += wh_amt
+        # 把每个 (年,币种) 的"实际预提税"一次性分摊到各来源(股票优先), 折 CNY,
+        # 并以各来源应纳税额为上限, 避免同一笔预提税被多个来源行重复抵免(分国不分项口径)。
+        wh_alloc_cny: dict[tuple[int, str, str], Decimal] = {}
+        for (a_yr, a_ccy) in {(y, c) for (y, c, _s) in div_by_key}:
+            total_wh_native = actual_wh.get((a_yr, a_ccy), Decimal("0"))
+            a_fx = _fx_to_cny(a_yr, a_ccy)
+            if total_wh_native <= 0 or a_fx is None:
+                continue
+            remaining = (total_wh_native * a_fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            grp_srcs = sorted(
+                [s for (y, c, s) in div_by_key if y == a_yr and c == a_ccy],
+                key=lambda s: 0 if s == "stock" else 1,  # 股票分红优先抵免
+            )
+            for s in grp_srcs:
+                amt_cny_s = (div_by_key[(a_yr, a_ccy, s)] * a_fx).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP)
+                liab_s = (amt_cny_s * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                use = min(remaining, liab_s)
+                if use > 0:
+                    wh_alloc_cny[(a_yr, a_ccy, s)] = use
+                    remaining -= use
+                if remaining <= 0:
+                    break
         for (yr, ccy, src), amt in sorted(div_by_key.items()):
-            usd_fx = TAX_FX_USD_TO_CNY.get(yr)
-            if usd_fx is None:
-                fx = None
-            elif ccy == "USD":
-                fx = usd_fx
-            elif ccy == "HKD":
-                fx = usd_fx / TAX_HKD_PEG_DIVISOR
-            else:
-                fx = None
+            fx = _fx_to_cny(yr, ccy)
             amt_cny = (amt * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
                 if fx is not None else Decimal("0")
-            # Use actual withholding from statement if available; fallback to 10% estimate
-            wh_actual = actual_wh.get((yr, ccy), Decimal("0"))
-            if wh_actual > 0:
-                withheld_native = wh_actual
-                wh_note = "实际扣缴"
+            # 境外税收抵免: 有实际预提税则用一次性分摊结果(已折 CNY 且已封顶, 计一次);
+            # 否则美股按中美协定估算 10%。
+            if actual_wh.get((yr, ccy), Decimal("0")) > 0:
+                withheld_cny = wh_alloc_cny.get((yr, ccy, src), Decimal("0"))
+                wh_note = "实际扣缴" if withheld_cny > 0 else ""
             elif ccy == "USD":
                 withheld_native = (amt * US_WITHHOLDING_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                withheld_cny = (withheld_native * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
+                    if fx is not None else Decimal("0")
                 wh_note = "估算10%"
             else:
-                withheld_native = Decimal("0")
+                withheld_cny = Decimal("0")
                 wh_note = ""
-            withheld_cny = (withheld_native * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
-                if fx is not None and withheld_native > 0 else Decimal("0")
             # China tax due = 20% of CNY amount - foreign tax credit
             china_tax_full = (amt_cny * TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             china_tax_due = max(china_tax_full - withheld_cny, Decimal("0"))
@@ -2420,15 +2451,7 @@ def _build_tax_estimate(by_year_asset: dict) -> dict:
     pnl_cny_by_year: dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
     rows = []
     for (yr, ccy), pnl in sorted(agg.items()):
-        usd_fx = TAX_FX_USD_TO_CNY.get(yr)
-        if usd_fx is None:
-            fx = None
-        elif ccy == "USD":
-            fx = usd_fx
-        elif ccy == "HKD":
-            fx = usd_fx / TAX_HKD_PEG_DIVISOR
-        else:
-            fx = None
+        fx = _fx_to_cny(yr, ccy)
         pnl_cny = (pnl * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) \
             if fx is not None else Decimal("0")
         pnl_cny_by_year[yr] += pnl_cny

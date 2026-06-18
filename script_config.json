@@ -5,6 +5,9 @@
     "target_accounts: 你的富途账户号码列表 (可选,留空会自动从 xlsx 扫描)",
     "其余字段可省略,使用内置默认值",
     "",
+    "hkd_rates: 各纳税年度末 港币兑人民币 直接中间价 (按年份填,如 2025:0.90322);",
+    "  缺失时回退 USD/CNY ÷ hkd_peg_divisor 近似折算",
+    "",
     "overrides 用于补充 DTC IN / Gift 等转入事件的成本基础:",
     "  当富途账单中转入户(DTC IN)或赠予(Gift)没有真实买入价时,",
     "  在此手工填入转入时的市价。程序会自动:",
@@ -33,16 +36,15 @@
     "2024": "7.1884",
     "2025": "7.0288"
   },
-  "hkd_peg_divisor": "7.8",
+  "hkd_rates": {
+    "2025": "0.90322"
+  },
+  "hkd_peg_divisor": "7.781935741",
   "overrides": [
   ],
   "skip_categories": [],
   "skip_directions": [],
   "output_html": "capital_gains_report_v2.html",
   "output_json": "capital_gains_report_v2.json",
-  "target_accounts": [
-    "",
-    "",
-    ""
-  ]
+  "target_accounts": []
 }

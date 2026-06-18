@@ -33,16 +33,12 @@
     "2024": "7.1884",
     "2025": "7.0288"
   },
-  "hkd_peg_divisor": "7.8",
+  "hkd_peg_divisor": "7.781935741",
   "overrides": [
   ],
   "skip_categories": [],
   "skip_directions": [],
   "output_html": "capital_gains_report_v2.html",
   "output_json": "capital_gains_report_v2.json",
-  "target_accounts": [
-    "",
-    "",
-    ""
-  ]
+  "target_accounts": []
 }

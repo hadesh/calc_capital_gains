@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 个人财务数据与生成的报表 (请勿提交)
+*.xlsx
+*_年度账单_*.xlsx
+capital_gains_report_v2*.html
+capital_gains_report_v2*.json
